@@ -7,7 +7,10 @@ import (
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
 	"golang.org/x/xerrors"
+	"strconv"
 )
+
+var counter int64 = 0
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
@@ -24,10 +27,13 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		return nil
 	})
 
+	counter++
+
 	return &node{
 		conf:         conf,
 		routingTable: map[string]string{conf.Socket.GetAddress(): conf.Socket.GetAddress()},
 		neighbours:   make([]string, 0),
+		name:         "node" + strconv.FormatInt(counter, 10),
 	}
 }
 
@@ -41,6 +47,7 @@ type node struct {
 	conf         peer.Configuration
 	routingTable peer.RoutingTable
 	neighbours   []string
+	name         string
 }
 
 // Start implements peer.Service
@@ -88,6 +95,10 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 		fmt.Println(k, v)
 	}
 
+	if _, ok := n.routingTable[dest]; !ok {
+		return xerrors.Errorf("%s is not in the routing table of %s", dest, n.name)
+	}
+
 	header := transport.NewHeader(n.conf.Socket.GetAddress(), n.conf.Socket.GetAddress(), dest, 0)
 
 	packet := transport.Packet{
@@ -95,7 +106,7 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 		Msg:    &msg,
 	}
 
-	err := n.conf.Socket.Send(dest, packet, 0)
+	err := n.conf.Socket.Send(n.routingTable[dest], packet, 0)
 	return err
 }
 
