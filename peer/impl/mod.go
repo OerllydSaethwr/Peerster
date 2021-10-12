@@ -37,7 +37,7 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 type node struct {
 	peer.Peer
 	// You probably want to keep the peer.Configuration on this struct:
-	quit         chan bool
+	quit         bool
 	conf         peer.Configuration
 	routingTable peer.RoutingTable
 	neighbours   []string
@@ -45,10 +45,9 @@ type node struct {
 
 // Start implements peer.Service
 func (n *node) Start() error {
-	n.quit = make(chan bool)
 	go func() {
 		for {
-			if <- n.quit {
+			if n.quit {
 				return
 			}
 
@@ -78,13 +77,18 @@ func (n *node) Start() error {
 
 // Stop implements peer.Service
 func (n *node) Stop() error {
-	n.quit <- true
+	n.quit = true
 	return nil //TODO
 }
 
 // Unicast implements peer.Messaging
 func (n *node) Unicast(dest string, msg transport.Message) error {
-	header := transport.NewHeader(n.conf.Socket.GetAddress(), n.routingTable[dest], dest, 0)
+
+	for k, v := range n.routingTable {
+		fmt.Println(k, v)
+	}
+
+	header := transport.NewHeader(n.conf.Socket.GetAddress(), n.conf.Socket.GetAddress(), dest, 0)
 
 	packet := transport.Packet{
 		Header: &header,
@@ -118,7 +122,11 @@ func (n *node) GetRoutingTable() peer.RoutingTable {
 
 // SetRoutingEntry implements peer.Service
 func (n *node) SetRoutingEntry(origin, relayAddr string) {
-	n.routingTable[origin] = relayAddr
+	if relayAddr == "" {
+		delete(n.routingTable, origin)
+	} else {
+		n.routingTable[origin] = relayAddr
+	}
 
 	if origin == relayAddr {
 		n.neighbours = append(n.neighbours, origin)

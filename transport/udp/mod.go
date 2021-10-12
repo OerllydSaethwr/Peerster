@@ -138,6 +138,11 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 		return transport.Packet{}, xerrors.Errorf("Socket is closed")
 	}
 
+	// Set max timeout
+	if timeout == 0 {
+		timeout = math.MaxInt64
+	}
+
 	// Create read buffer
 	bigBuf := make([]byte, bufSize)
 
@@ -173,6 +178,7 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 
 	select {
 	case pkt := <- pktChan:
+		s.ins.add(pkt)
 		return pkt, nil
 	case <- time.After(timeout):
 		return transport.Packet{}, transport.TimeoutErr(timeout)
