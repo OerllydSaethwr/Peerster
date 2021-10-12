@@ -1,4 +1,4 @@
-# Peerster design
+ Peerster design
 
 Peerster refers to a gossip-based P2P system composed of multiple *peers*
 interacting with each other. A peer refers to an autonomous entity in the
