@@ -1,6 +1,7 @@
 package udp
 
 import (
+	"fmt"
 	"golang.org/x/xerrors"
 	"math"
 	"net"
@@ -37,9 +38,14 @@ func (n *UDP) CreateSocket(address string) (transport.ClosableSocket, error) {
 		return nil, err
 	}
 
+	actualAddressRaw := connection.LocalAddr()
+	actualAddress, err := net.ResolveUDPAddr("udp", actualAddressRaw.String())
+
+	fmt.Printf("New socket now listening at %s\n", actualAddress)
+
 	return &Socket{
 		UDP:      n,
-		address:  addr,
+		address:  actualAddress,
 		ins:      packets{},
 		outs:     packets{},
 		listener: connection,
@@ -91,7 +97,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 	if err != nil {
 		return err
 	}
-	if len(marshalledPacket) > bufSize {
+	if len(marshalledPacket) > 1024 {
 		return xerrors.Errorf("Message exceeds buffer size limit")
 	}
 	
@@ -107,13 +113,16 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 	if err != nil {
 		return err
 	}
-	
+
+	fmt.Printf("Sending packet to %s ...", connection.RemoteAddr())
+
 	// Delegate sending packet to OS, return error if timeout is reached //TODO
 	_, err = connection.Write(marshalledPacket)
 	if err != nil {
 		return err
 	}
 
+	fmt.Println(" done")
 	s.outs.add(pkt)
 
 	return nil
@@ -130,7 +139,7 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 	}
 
 	// Create read buffer
-	buf := make([]byte, bufSize)
+	buf := make([]byte, 1024)
 
 	// Block and wait to receive packet
 	// Calling Close on the socket unblocks this and returns an error
@@ -144,11 +153,15 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 			return
 		}
 
+		fmt.Printf("Reading incoming packet at %s", s.listener.LocalAddr())
+
 		pkt := transport.Packet{}
 		err = pkt.Unmarshal(buf)
 		if err != nil {
+			fmt.Println(err)
 			return
 		}
+
 
 		pktChan <- pkt
 	}()

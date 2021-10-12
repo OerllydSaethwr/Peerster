@@ -6,7 +6,7 @@ import (
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
-	"time"
+	"golang.org/x/xerrors"
 )
 
 // NewPeer creates a new peer. You can change the content and location of this
@@ -14,9 +14,14 @@ import (
 func NewPeer(conf peer.Configuration) peer.Peer {
 	// here you must return a struct that implements the peer.Peer functions.
 	// Therefore, you are free to rename and change it as you want.
-	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{Message: ""}, func(message types.Message, packet transport.Packet) error {
-		fmt.Println(message)
-		return nil //TODO
+	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{}, func(message types.Message, packet transport.Packet) error {
+		chatMsg, ok := message.(*types.ChatMessage)
+		if !ok {
+			return xerrors.Errorf("wrong type: %T", message)
+		}
+
+		fmt.Println(chatMsg)
+		return nil
 	})
 
 	return &node{
@@ -47,7 +52,7 @@ func (n *node) Start() error {
 				return
 			}
 
-			pkt, err := n.conf.Socket.Recv(time.Second * 1)
+			pkt, err := n.conf.Socket.Recv(0)
 			if errors.Is(err, transport.TimeoutErr(0)) {
 				continue
 			}
