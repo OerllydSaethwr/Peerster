@@ -97,7 +97,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 	if err != nil {
 		return err
 	}
-	if len(marshalledPacket) > 1024 {
+	if len(marshalledPacket) > bufSize {
 		return xerrors.Errorf("Message exceeds buffer size limit")
 	}
 	
@@ -114,7 +114,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 		return err
 	}
 
-	fmt.Printf("Sending packet to %s ...", connection.RemoteAddr())
+	fmt.Printf("Sending %vb packet to %s ...", len(marshalledPacket), connection.RemoteAddr())
 
 	// Delegate sending packet to OS, return error if timeout is reached //TODO
 	_, err = connection.Write(marshalledPacket)
@@ -139,7 +139,7 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 	}
 
 	// Create read buffer
-	buf := make([]byte, 1024)
+	bigBuf := make([]byte, bufSize)
 
 	// Block and wait to receive packet
 	// Calling Close on the socket unblocks this and returns an error
@@ -148,12 +148,16 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 	pktChan := make(chan transport.Packet, 1)
 
 	go func() {
-		_, _, err := s.listener.ReadFromUDP(buf)
+		bytesRead, _, err := s.listener.ReadFromUDP(bigBuf)
 		if err != nil {
 			return
 		}
 
-		fmt.Printf("Reading incoming packet at %s", s.listener.LocalAddr())
+		buf := make([]byte, bytesRead)
+
+		copy(buf, bigBuf)
+
+		fmt.Printf("Reading incoming packet at %s ... ", s.listener.LocalAddr())
 
 		pkt := transport.Packet{}
 		err = pkt.Unmarshal(buf)
@@ -162,6 +166,7 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 			return
 		}
 
+		fmt.Printf("done\n")
 
 		pktChan <- pkt
 	}()
