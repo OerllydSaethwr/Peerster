@@ -1,7 +1,7 @@
 package udp
 
 import (
-	"fmt"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/xerrors"
 	"math"
 	"net"
@@ -41,7 +41,7 @@ func (n *UDP) CreateSocket(address string) (transport.ClosableSocket, error) {
 	actualAddressRaw := connection.LocalAddr()
 	actualAddress, err := net.ResolveUDPAddr("udp", actualAddressRaw.String())
 
-	fmt.Printf("New socket now listening at %s\n", actualAddress)
+	log.Info().Msgf("New socket now listening at %s", actualAddress)
 
 	return &Socket{
 		UDP:      n,
@@ -51,17 +51,6 @@ func (n *UDP) CreateSocket(address string) (transport.ClosableSocket, error) {
 		listener: connection,
 		closed:   false,
 	}, nil
-	//addr, err := net.ResolveUDPAddr("udp", address)
-	//if err != nil {
-	//	return nil, err //TODO
-	//}
-	//
-	//return &Socket{
-	//	address:   addr,
-	//	ins:       make([]transport.Packet, 0),
-	//	outs:      make([]transport.Packet, 0),
-	//	listening: false,
-	//}, nil //TODO
 }
 
 // Socket implements a network socket using UDP.
@@ -114,7 +103,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 		return err
 	}
 
-	fmt.Printf("Sending %vb packet to %s ...", len(marshalledPacket), connection.RemoteAddr())
+	log.Info().Msgf("Sending %vb packet to %s ...", len(marshalledPacket), connection.RemoteAddr())
 
 	// Delegate sending packet to OS, return error if timeout is reached //TODO
 	_, err = connection.Write(marshalledPacket)
@@ -122,7 +111,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 		return err
 	}
 
-	fmt.Println(" done")
+	log.Info().Msgf(" done")
 	s.outs.add(pkt)
 
 	return nil
@@ -162,16 +151,16 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 
 		copy(buf, bigBuf)
 
-		fmt.Printf("Reading incoming packet at %s ... ", s.listener.LocalAddr())
+		log.Info().Msgf("Reading incoming packet at %s ... ", s.listener.LocalAddr())
 
 		pkt := transport.Packet{}
 		err = pkt.Unmarshal(buf)
 		if err != nil {
-			fmt.Println(err)
+			log.Err(err)
 			return
 		}
 
-		fmt.Printf("done\n")
+		log.Info().Msgf("done")
 
 		pktChan <- pkt
 	}()
@@ -202,21 +191,6 @@ func (s *Socket) GetOuts() []transport.Packet {
 	return s.outs.getAll()
 }
 
-type Traffic struct {
-	sync.Mutex
-
-	items []item
-}
-
-type item struct {
-	from          string
-	to            string
-	typeStr       string
-	pkt           transport.Packet
-	globalCounter int
-	typeCounter   int
-}
-
 type packets struct {
 	sync.Mutex
 	data []transport.Packet
@@ -241,4 +215,3 @@ func (p *packets) getAll() []transport.Packet {
 
 	return res
 }
-
