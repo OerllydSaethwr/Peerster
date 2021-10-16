@@ -4,6 +4,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/xerrors"
 	"math"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ func NewUDP() transport.Transport {
 // UDP implements a transport layer using UDP
 //
 // - implements transport.Transport
-type UDP struct {}
+type UDP struct{}
 
 // CreateSocket implements transport.Transport
 func (n *UDP) CreateSocket(address string) (transport.ClosableSocket, error) {
@@ -59,10 +60,10 @@ func (n *UDP) CreateSocket(address string) (transport.ClosableSocket, error) {
 // - implements transport.ClosableSocket
 type Socket struct {
 	*UDP
-	address *net.UDPAddr
-	ins packets
-	outs packets
-	closed bool
+	address  *net.UDPAddr
+	ins      packets
+	outs     packets
+	closed   bool
 	listener *net.UDPConn
 }
 
@@ -75,12 +76,12 @@ func (s *Socket) Close() error {
 
 // Send implements transport.Socket
 func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) error {
-	
+
 	// Set max timeout
 	if timeout == 0 {
 		timeout = math.MaxInt64
 	}
-	
+
 	// Transform packet to raw bytes
 	marshalledPacket, err := pkt.Marshal()
 	if err != nil {
@@ -89,7 +90,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 	if len(marshalledPacket) > bufSize {
 		return xerrors.Errorf("Message exceeds buffer size limit")
 	}
-	
+
 	// Format destination address as UDPAddr
 	d, err := net.ResolveUDPAddr("udp", dest)
 	if err != nil {
@@ -103,7 +104,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 		return err
 	}
 
-	log.Info().Msgf("Sending %vb packet to %s ...", len(marshalledPacket), connection.RemoteAddr())
+	log.Info().Msgf("Sending %vb packet (#%s) to %s ...", len(marshalledPacket), pkt.Header.PacketID, connection.RemoteAddr())
 
 	// Delegate sending packet to OS, return error if timeout is reached //TODO
 	_, err = connection.Write(marshalledPacket)
@@ -111,7 +112,7 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 		return err
 	}
 
-	log.Info().Msgf(" done")
+	log.Info().Msgf(" done (#%s)", pkt.Header.PacketID)
 	s.outs.add(pkt)
 
 	return nil
@@ -151,25 +152,24 @@ func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 
 		copy(buf, bigBuf)
 
-		log.Info().Msgf("Reading incoming packet at %s ... ", s.listener.LocalAddr())
-
-		pkt := transport.Packet{}
+		pkt := transport.Packet{Header: &transport.Header{PacketID: GetRandString()}}
+		log.Info().Msgf("Reading incoming packet (#%s) at %s ... ", pkt.Header.PacketID, s.listener.LocalAddr())
 		err = pkt.Unmarshal(buf)
 		if err != nil {
 			log.Err(err)
 			return
 		}
 
-		log.Info().Msgf("done")
+		log.Info().Msgf("done (#%s)", pkt.Header.PacketID)
 
 		pktChan <- pkt
 	}()
 
 	select {
-	case pkt := <- pktChan:
+	case pkt := <-pktChan:
 		s.ins.add(pkt)
 		return pkt, nil
-	case <- time.After(timeout):
+	case <-time.After(timeout):
 		return transport.Packet{}, transport.TimeoutErr(timeout)
 	}
 }
@@ -214,4 +214,16 @@ func (p *packets) getAll() []transport.Packet {
 	}
 
 	return res
+}
+
+// GetRandString returns a random string.
+func GetRandString() string {
+	charset := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+	res := make([]byte, 12)
+	for i := range res {
+		res[i] = charset[rand.Intn(len(charset))]
+	}
+
+	return string(res)
 }

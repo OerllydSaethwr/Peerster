@@ -3,7 +3,6 @@ package impl
 import (
 	"errors"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
@@ -19,14 +18,41 @@ import (
 var nodeCounter int64 = 0
 
 // Logging setup
+const defaultLevel = zerolog.InfoLevel
+
+// Logging and error handling setup
+func init() {
+	lvl := "error"
+
+	var level zerolog.Level
+
+	switch lvl {
+	case "error":
+		level = zerolog.ErrorLevel
+	case "warn":
+		level = zerolog.WarnLevel
+	case "info":
+		level = zerolog.InfoLevel
+	case "debug":
+		level = zerolog.DebugLevel
+	case "trace":
+		level = zerolog.TraceLevel
+	case "":
+		level = defaultLevel
+	default:
+		level = zerolog.TraceLevel
+	}
+
+	Logger = Logger.Level(level)
+}
+
 var logout = zerolog.ConsoleWriter{
 	Out:        os.Stdout,
 	TimeFormat: time.RFC3339,
 }
 
-const lvl = "error"
-const defaultLevel = zerolog.NoLevel
 var Logger = zerolog.New(logout).Level(zerolog.NoLevel).With().Timestamp().Logger().With().Caller().Logger()
+var log zerolog.Logger
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
@@ -46,14 +72,14 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 	atomic.AddInt64(&nodeCounter, 1)
 
 	return &node{
-		conf:         conf,
+		conf: conf,
 		routingTable: cRoutingTable{
-			RWMutex:  sync.RWMutex{},
-			m:        map[string]string{conf.Socket.GetAddress(): conf.Socket.GetAddress()},
+			RWMutex: sync.RWMutex{},
+			m:       map[string]string{conf.Socket.GetAddress(): conf.Socket.GetAddress()},
 		},
-		name:         "node" + strconv.FormatInt(atomic.LoadInt64(&nodeCounter), 10),
-		active: 	  false,
-		quit: make(chan bool),
+		name:   "node" + strconv.FormatInt(atomic.LoadInt64(&nodeCounter), 10),
+		active: false,
+		quit:   make(chan bool),
 	}
 }
 
@@ -85,39 +111,39 @@ func (n *node) Start() error {
 	n.active = true
 
 	go func() {
-		Loop:
-			for {
-				// Shut down node if signalled
-				select {
-				case <- n.quit:
-					break Loop
-				default:
-					// Block until packet is received
-					pkt, err := n.conf.Socket.Recv(time.Second * 1)
-					if errors.Is(err, transport.TimeoutErr(0)) {
-						log.Warn().Msgf(err.Error())
-						continue
+	Loop:
+		for {
+			// Shut down node if signalled
+			select {
+			case <-n.quit:
+				break Loop
+			default:
+				// Block until packet is received
+				pkt, err := n.conf.Socket.Recv(time.Second * 1)
+				if errors.Is(err, transport.TimeoutErr(0)) {
+					log.Warn().Msgf(err.Error())
+					continue
+				}
+
+				// If addressed to us, process packet, crash if something goes wrong
+				if pkt.Header.Destination == n.conf.Socket.GetAddress() {
+					err := n.conf.MessageRegistry.ProcessPacket(pkt)
+					if err != nil {
+						log.Err(err)
+						break
 					}
 
-					// If addressed to us, process packet, crash if something goes wrong
-					if pkt.Header.Destination == n.conf.Socket.GetAddress() {
-						err := n.conf.MessageRegistry.ProcessPacket(pkt)
-						if err != nil {
-							log.Err(err)
-							break
-						}
-
-						// Otherwise, relay packet, crash if something goes wrong
-					} else {
-						pkt.Header.RelayedBy = n.conf.Socket.GetAddress()
-						err := n.conf.Socket.Send(pkt.Header.Destination, pkt, 0)
-						if err != nil {
-							log.Err(err)
-							break
-						}
+					// Otherwise, relay packet, crash if something goes wrong
+				} else {
+					pkt.Header.RelayedBy = n.conf.Socket.GetAddress()
+					err := n.conf.Socket.Send(pkt.Header.Destination, pkt, 0)
+					if err != nil {
+						log.Err(err)
+						break
 					}
 				}
 			}
+		}
 
 		n.active = false
 
@@ -197,28 +223,4 @@ func (n *node) SetRoutingEntry(origin, relayAddr string) {
 	} else {
 		n.routingTable.m[origin] = relayAddr
 	}
-}
-
-// Logging and error handling setup
-func init() {
-	var level zerolog.Level
-
-	switch lvl {
-	case "error":
-		level = zerolog.ErrorLevel
-	case "warn":
-		level = zerolog.WarnLevel
-	case "info":
-		level = zerolog.InfoLevel
-	case "debug":
-		level = zerolog.DebugLevel
-	case "trace":
-		level = zerolog.TraceLevel
-	case "":
-		level = defaultLevel
-	default:
-		level = zerolog.TraceLevel
-	}
-
-	Logger = Logger.Level(level)
 }
