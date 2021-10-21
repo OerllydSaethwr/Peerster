@@ -1,6 +1,7 @@
 package udp
 
 import (
+	"bytes"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/xerrors"
 	"math"
@@ -121,57 +122,95 @@ func (s *Socket) Send(dest string, pkt transport.Packet, timeout time.Duration) 
 // Recv implements transport.Socket. It blocks until a packet is received, or
 // the timeout is reached. In the case the timeout is reached, return a
 // TimeoutErr.
+//func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
+//
+//	// Check if socket is closed
+//	if s.closed {
+//		return transport.Packet{}, xerrors.Errorf("Socket is closed")
+//	}
+//
+//	// Set max timeout
+//	if timeout == 0 {
+//		timeout = math.MaxInt64
+//	}
+//
+//	// Create read buffer
+//	bigBuf := make([]byte, bufSize)
+//
+//	// Block and wait to receive packet
+//	// Calling Close on the socket unblocks this and returns an error
+//	// If takes longer than timeout, ignore
+//
+//	pktChan := make(chan transport.Packet, 1)
+//
+//	go func() {
+//		bytesRead, _, err := s.listener.ReadFromUDP(bigBuf)
+//		if err != nil {
+//			return
+//		}
+//
+//		buf := make([]byte, bytesRead)
+//
+//		copy(buf, bigBuf)
+//
+//		pkt := transport.Packet{Header: &transport.Header{PacketID: GetRandString()}}
+//		log.Info().Msgf("Reading incoming packet (#%s) at %s ... ", pkt.Header.PacketID, s.listener.LocalAddr())
+//		err = pkt.Unmarshal(buf)
+//		if err != nil {
+//			log.Err(err)
+//			return
+//		}
+//
+//		log.Info().Msgf("done (#%s)", pkt.Header.PacketID)
+//
+//		pktChan <- pkt
+//	}()
+//
+//	select {
+//	case <-time.After(timeout):
+//		return transport.Packet{}, transport.TimeoutErr(timeout)
+//	default:
+//		pkt := <-pktChan
+//		s.ins.add(pkt)
+//		return pkt, nil
+//	}
+//}
+
 func (s *Socket) Recv(timeout time.Duration) (transport.Packet, error) {
 
-	// Check if socket is closed
 	if s.closed {
-		return transport.Packet{}, xerrors.Errorf("Socket is closed")
+		return transport.Packet{}, xerrors.Errorf("%s: Socket is closed", s.GetAddress())
 	}
 
-	// Set max timeout
-	if timeout == 0 {
-		timeout = math.MaxInt64
+	if timeout != 0 {
+		deadline := time.Now().Add(timeout)
+		err := s.listener.SetReadDeadline(deadline)
+		if err != nil {
+			return transport.Packet{}, err
+		}
 	}
 
-	// Create read buffer
-	bigBuf := make([]byte, bufSize)
+	data := make([]byte, bufSize)
+	_, _, err := s.listener.ReadFromUDP(data)
 
-	// Block and wait to receive packet
-	// Calling Close on the socket unblocks this and returns an error
-	// If takes longer than timeout, ignore
-
-	pktChan := make(chan transport.Packet, 1)
-
-	go func() {
-		bytesRead, _, err := s.listener.ReadFromUDP(bigBuf)
-		if err != nil {
-			return
+	if err != nil {
+		if e, ok := err.(net.Error); !ok || !e.Timeout() {
+			return transport.Packet{}, xerrors.Errorf("%s: Error on reading UDP buffer", s.GetAddress())
 		}
-
-		buf := make([]byte, bytesRead)
-
-		copy(buf, bigBuf)
-
-		pkt := transport.Packet{Header: &transport.Header{PacketID: GetRandString()}}
-		log.Info().Msgf("Reading incoming packet (#%s) at %s ... ", pkt.Header.PacketID, s.listener.LocalAddr())
-		err = pkt.Unmarshal(buf)
-		if err != nil {
-			log.Err(err)
-			return
-		}
-
-		log.Info().Msgf("done (#%s)", pkt.Header.PacketID)
-
-		pktChan <- pkt
-	}()
-
-	select {
-	case pkt := <-pktChan:
-		s.ins.add(pkt)
-		return pkt, nil
-	case <-time.After(timeout):
 		return transport.Packet{}, transport.TimeoutErr(timeout)
 	}
+
+	pkt := transport.Packet{Header: &transport.Header{PacketID: GetRandString()}}
+	log.Info().Msgf("%s: Incoming packet (#%s)", s.listener.LocalAddr(), pkt.Header.PacketID)
+	data = bytes.Trim(data, "\x00")
+	err = pkt.Unmarshal(data)
+	if err != nil {
+		return transport.Packet{}, err
+	}
+
+	s.ins.add(pkt)
+
+	return pkt, nil
 }
 
 // GetAddress implements transport.Socket. It returns the address assigned. Can

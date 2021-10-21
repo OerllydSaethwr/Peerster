@@ -22,7 +22,7 @@ const defaultLevel = zerolog.InfoLevel
 
 // Logging and error handling setup
 func init() {
-	lvl := "error"
+	lvl := "info"
 
 	var level zerolog.Level
 
@@ -65,7 +65,7 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 			return xerrors.Errorf("wrong type: %T", message)
 		}
 
-		log.Info().Msgf(chatMsg.String())
+		log.Info().Msgf("%s", chatMsg)
 		return nil
 	})
 
@@ -73,7 +73,7 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 
 	return &node{
 		conf: conf,
-		routingTable: cRoutingTable{
+		routingTable: ConcurrentRoutingTable{
 			RWMutex: sync.RWMutex{},
 			m:       map[string]string{conf.Socket.GetAddress(): conf.Socket.GetAddress()},
 		},
@@ -92,11 +92,11 @@ type node struct {
 	quit         chan bool
 	active       bool
 	conf         peer.Configuration
-	routingTable cRoutingTable
+	routingTable ConcurrentRoutingTable
 	name         string
 }
 
-type cRoutingTable struct {
+type ConcurrentRoutingTable struct {
 	sync.RWMutex
 	m peer.RoutingTable
 }
@@ -189,38 +189,56 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 
 // AddPeer implements peer.Service
 func (n *node) AddPeer(addr ...string) {
-	n.routingTable.Lock()
-	defer n.routingTable.Unlock()
-
 	for _, v := range addr {
 		if v != n.conf.Socket.GetAddress() {
-			n.routingTable.m[v] = v
+			n.routingTable.Add(v, v)
 		}
 	}
 }
 
 // GetRoutingTable implements peer.Service
 func (n *node) GetRoutingTable() peer.RoutingTable {
-	n.routingTable.Lock()
-	defer n.routingTable.Unlock()
-
-	clone := make(map[string]string)
-
-	for k, v := range n.routingTable.m {
-		clone[k] = v
-	}
-
-	return clone
+	return n.routingTable.CopyTable()
 }
 
 // SetRoutingEntry implements peer.Service
 func (n *node) SetRoutingEntry(origin, relayAddr string) {
-	n.routingTable.Lock()
-	defer n.routingTable.Unlock()
-
 	if relayAddr == "" {
-		delete(n.routingTable.m, origin)
+		n.routingTable.Remove(origin)
 	} else {
-		n.routingTable.m[origin] = relayAddr
+		n.routingTable.Add(origin, relayAddr)
 	}
+}
+
+func (table *ConcurrentRoutingTable) Add(src, dst string) {
+	table.Lock()
+	defer table.Unlock()
+	table.m[src] = dst
+}
+
+func (table *ConcurrentRoutingTable) Get(dst string) string {
+	table.Lock()
+	defer table.Unlock()
+	if val, ok := table.m[dst]; ok {
+		return val
+	}
+	return ""
+}
+
+func (table *ConcurrentRoutingTable) Remove(src string) {
+	table.Lock()
+	defer table.Unlock()
+	delete(table.m, src)
+}
+
+func (table *ConcurrentRoutingTable) CopyTable() peer.RoutingTable {
+	copiedTable := make(map[string]string)
+	table.Lock()
+	defer table.Unlock()
+
+	for index, element := range table.m {
+		copiedTable[index] = element
+	}
+
+	return copiedTable
 }
