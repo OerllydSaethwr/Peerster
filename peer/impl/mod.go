@@ -72,6 +72,8 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 
 		rumorCount: 0,
 		status:     map[string]uint{},
+		rumors:     map[string][]types.Rumor{},
+		ackWaiters: map[string]chan bool{},
 	}
 
 	atomic.AddInt64(&nodeCounter, 1)
@@ -100,6 +102,8 @@ type node struct {
 
 	rumorCount uint
 	status     map[string]uint
+	rumors     map[string][]types.Rumor
+	ackWaiters map[string]chan bool
 }
 
 type ConcurrentRoutingTable struct {
@@ -122,12 +126,12 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 		return xerrors.Errorf("%s: nested rumors are not suppoerted", n.GetAddress())
 	}
 
-	packetOrigin := packet.Header.Source
-
 	rumorsMsg, ok := message.(*types.RumorsMessage)
 	if !ok {
 		return xerrors.Errorf("wrong type: %T", message)
 	}
+
+	packetOrigin := packet.Header.Source
 
 	// TODO: what the fuck do we do here
 	forward := false
@@ -148,6 +152,8 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 
 		forward = true
 
+		n.rumors[rumor.Origin] = append(n.rumors[rumor.Origin], rumor)
+
 		err := n.conf.MessageRegistry.ProcessPacket(embeddedPkt)
 		if err != nil {
 			return xerrors.Errorf("%s: error processing rumor: %s", n.GetAddress(), err)
@@ -160,7 +166,7 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 		dest := n.GetRandomNeighbour(excludeList...)
 
 		if dest != "" {
-			err := n.Unicast(dest, *packet.Msg)
+			err := n.SendRumorsMessage(dest, *packet.Msg)
 			if err != nil {
 				return xerrors.Errorf("%s: error forwarding rumor: %s", n.GetAddress(), err)
 			}
@@ -195,7 +201,7 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 			Msg:    &ackMsgMarshalled,
 		}
 
-		n.conf.Socket.Send(dest, responsePacket, 0)
+		err = n.conf.Socket.Send(dest, responsePacket, 0)
 
 		if err != nil {
 			return xerrors.Errorf("%s: error sending ACK message: %s", n.GetAddress(), err)
@@ -206,10 +212,129 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 }
 
 func (n *node) StatusMessageCallback(message types.Message, packet transport.Packet) error {
+	statusMsg, ok := message.(*types.StatusMessage)
+	if !ok {
+		return xerrors.Errorf("wrong type: %T", message)
+	}
+
+	origin := packet.Header.Source
+
+	n.SetRoutingEntry(origin, packet.Header.RelayedBy)
+
+	// compare views, return 1-4
+	// switch and do 1-4
+	state := n.CompareViews(*statusMsg)
+
+	var err error
+
+	switch state {
+	case 1:
+		err = n.SendStatusToPeer(origin)
+	case 2:
+		err = n.SendCatchUpToPeer(origin, *statusMsg)
+	case 3:
+		err = n.SendStatusToPeer(origin)
+		err = n.SendCatchUpToPeer(origin, *statusMsg)
+	case 4:
+		err = n.SendStatusToRandomPeer(origin)
+	}
+
+	if err != nil {
+		return n.ef("error processing status message", err)
+	}
+
+	return nil
+}
+
+func (n *node) SendStatusToPeer(dest string) error {
+	var statusMsg types.StatusMessage = n.GetStatus()
+	statusMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(statusMsg)
+
+	if err != nil {
+		return n.ef("error marshalling status message", err)
+	}
+
+	err = n.Unicast(dest, statusMsgMarshalled)
+	if err != nil {
+		return n.ef("error sending status message", err)
+	}
+
+	return nil
+}
+
+func (n *node) SendCatchUpToPeer(dest string, theirView map[string]uint) error {
+	rumorsToSend := make([]types.Rumor, 0)
+
+	for origin, rumorList := range n.rumors {
+
+		// Make copy so that we don't accidentally delete stuff
+		rumorListCopy := make([]types.Rumor, len(rumorList))
+		copy(rumorListCopy, rumorList)
+
+		theirSequence := theirView[origin]
+
+		if theirSequence >= uint(len(rumorList)) {
+			continue
+		}
+
+		for i := theirSequence; i < uint(len(rumorListCopy)); i++ {
+			rumorsToSend = append(rumorsToSend, rumorListCopy[i])
+		}
+	}
+
+	rumorsMsg := types.RumorsMessage{Rumors: rumorsToSend}
+
+	rumorsMessageMarshalled, err := n.conf.MessageRegistry.MarshalMessage(rumorsMsg)
+
+	if err != nil {
+		return n.ef("error mashalling status message response", err)
+	}
+
+	err = n.SendRumorsMessage(dest, rumorsMessageMarshalled)
+	if err != nil {
+		return n.ef("error sending status message response", err)
+	}
+
+	return nil
+}
+
+func (n *node) SendStatusToRandomPeer(origin string) error {
+	if rand.Float64() > n.conf.ContinueMongering {
+		return nil
+	}
+
+	dest := n.GetRandomNeighbour(origin)
+	err := n.SendStatusToPeer(dest)
+	if err != nil {
+		return n.ef("error sending status to random peer", err)
+	}
+
 	return nil
 }
 
 func (n *node) AckMessageCallback(message types.Message, packet transport.Packet) error {
+	ackMsg, ok := message.(*types.AckMessage)
+	if !ok {
+		return xerrors.Errorf("wrong type: %T", message)
+	}
+
+	n.ackWaiters[ackMsg.AckedPacketID] <- true
+
+	statusMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(ackMsg.Status)
+	if err != nil {
+		return n.ef("error marshalling ack embedded status message", err)
+	}
+
+	statusPkt := transport.Packet{
+		Header: packet.Header,
+		Msg:    &statusMsgMarshalled,
+	}
+
+	err = n.conf.MessageRegistry.ProcessPacket(statusPkt)
+	if err != nil {
+		return n.ef("error processing ack embedded status message", err)
+	}
+
 	return nil
 }
 
@@ -249,6 +374,7 @@ func (n *node) GetRandomNeighbour(exclude ...string) string {
 	}
 
 	// Pick neighbour to send to
+	rand.Seed(time.Now().UnixNano())
 	randomIndex := rand.Intn(len(clonedRoutingTable))
 
 	// Get keyset
@@ -261,6 +387,52 @@ func (n *node) GetRandomNeighbour(exclude ...string) string {
 
 	// Randomly index into keys
 	return keys[randomIndex]
+}
+
+// CompareViews Returns a case number 1-4 corresponding to the cases in the handout
+func (n *node) CompareViews(theirView map[string]uint) uint {
+	ourView := n.status
+
+	weHaveNewViews, theyHaveNewViews := false, false
+
+	for k := range ourView {
+		if _, ok := theirView[k]; !ok {
+			weHaveNewViews = true
+		} else if ourView[k] > theirView[k] {
+			weHaveNewViews = true
+		} else if ourView[k] < theirView[k] {
+			theyHaveNewViews = true
+		}
+	}
+
+	for k := range theirView {
+		if _, ok := ourView[k]; !ok {
+			theyHaveNewViews = true
+		} else if theirView[k] > ourView[k] {
+			theyHaveNewViews = true
+		} else if theirView[k] < ourView[k] {
+			weHaveNewViews = true
+		}
+	}
+
+	if theyHaveNewViews && !weHaveNewViews {
+		return 1
+	} else if !theyHaveNewViews && weHaveNewViews {
+		return 2
+	} else if theyHaveNewViews && weHaveNewViews {
+		return 3
+	} else {
+		return 4
+	}
+}
+
+func (n *node) SendRumorsMessage(dest string, message transport.Message) error {
+	err := n.Unicast(dest, message)
+
+	if err != nil {
+		return n.ef("error sending rumors message", err)
+	}
+	return nil
 }
 
 // Start implements peer.Service
@@ -377,7 +549,41 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 	}
 
 	err := n.conf.Socket.Send(n.routingTable.m[dest], packet, 0)
-	return err
+	if err != nil {
+		return n.ef("error sending packet", err)
+	}
+
+	// This is straight up bs
+	n.ackWaiters[packet.Header.PacketID] = make(chan bool, 1)
+	if msg.Type == (types.RumorsMessage{}).Name() && n.conf.AckTimeout != 0 {
+
+		go func() {
+			excludeList := make([]string, 0)
+
+			for {
+				select {
+
+				// Packet ACK received
+				case <-n.ackWaiters[packet.Header.PacketID]:
+					return
+
+				// Timeout reached
+				case <-time.After(n.conf.AckTimeout):
+					excludeList = append(excludeList, dest)
+					dest = n.GetRandomNeighbour(excludeList...)
+
+					// Exhausted list of neighbours that we could send to
+					if dest == "" {
+						return
+					}
+
+					n.conf.Socket.Send(n.routingTable.m[dest], packet, 0)
+				}
+			}
+		}()
+	}
+
+	return nil
 }
 
 func (n *node) Broadcast(msg transport.Message) error {
@@ -480,6 +686,14 @@ func (table *ConcurrentRoutingTable) CopyTable() peer.RoutingTable {
 	}
 
 	return copiedTable
+}
+
+func (n *node) ef(err1 string, err2 error) error {
+	return xerrors.Errorf("%s: %s: %s", n.GetAddress(), err1, err2)
+}
+
+func (n *node) GetStatus() map[string]uint {
+	return Copy(n.status)
 }
 
 func Copy(m map[string]uint) map[string]uint {
