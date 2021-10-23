@@ -73,7 +73,10 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		rumorCount: 0,
 		status:     map[string]uint{},
 		rumors:     map[string][]types.Rumor{},
-		ackWaiters: map[string]chan bool{},
+		ackWaiters: ConcurrentAckWaiters{
+			RWMutex: sync.RWMutex{},
+			m:       map[string]chan bool{},
+		},
 	}
 
 	atomic.AddInt64(&nodeCounter, 1)
@@ -103,12 +106,19 @@ type node struct {
 	rumorCount uint
 	status     map[string]uint
 	rumors     map[string][]types.Rumor
-	ackWaiters map[string]chan bool
+	ackWaiters ConcurrentAckWaiters
+	statusLock sync.RWMutex
+	rumorLock  sync.RWMutex
 }
 
 type ConcurrentRoutingTable struct {
 	sync.RWMutex
 	m peer.RoutingTable
+}
+
+type ConcurrentAckWaiters struct {
+	sync.RWMutex
+	m map[string]chan bool
 }
 
 func (n *node) ChatMessageCallback(message types.Message, packet transport.Packet) error {
@@ -152,7 +162,9 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 
 		forward = true
 
+		n.rumorLock.Lock()
 		n.rumors[rumor.Origin] = append(n.rumors[rumor.Origin], rumor)
+		n.rumorLock.Unlock()
 
 		err := n.conf.MessageRegistry.ProcessPacket(embeddedPkt)
 		if err != nil {
@@ -188,7 +200,9 @@ func (n *node) RumorsMessageCallback(message types.Message, packet transport.Pac
 
 		dest := packetOrigin
 
+		n.statusLock.Lock()
 		ackMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(ackMsg)
+		n.statusLock.Unlock()
 
 		if err != nil {
 			return xerrors.Errorf("%s: error marshalling ACK message: %s", n.GetAddress(), err)
@@ -265,6 +279,7 @@ func (n *node) SendStatusToPeer(dest string) error {
 func (n *node) SendCatchUpToPeer(dest string, theirView map[string]uint) error {
 	rumorsToSend := make([]types.Rumor, 0)
 
+	n.rumorLock.Lock()
 	for origin, rumorList := range n.rumors {
 
 		// Make copy so that we don't accidentally delete stuff
@@ -281,6 +296,8 @@ func (n *node) SendCatchUpToPeer(dest string, theirView map[string]uint) error {
 			rumorsToSend = append(rumorsToSend, rumorListCopy[i])
 		}
 	}
+
+	n.rumorLock.Unlock()
 
 	rumorsMsg := types.RumorsMessage{Rumors: rumorsToSend}
 
@@ -318,7 +335,7 @@ func (n *node) AckMessageCallback(message types.Message, packet transport.Packet
 		return xerrors.Errorf("wrong type: %T", message)
 	}
 
-	n.ackWaiters[ackMsg.AckedPacketID] <- true
+	n.ackWaiters.Get(ackMsg.AckedPacketID) <- true
 
 	statusMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(ackMsg.Status)
 	if err != nil {
@@ -343,6 +360,25 @@ func (n *node) EmptyMessageCallback(message types.Message, packet transport.Pack
 }
 
 func (n *node) PrivateMessageCallback(message types.Message, packet transport.Packet) error {
+	privateMsg, ok := message.(*types.PrivateMessage)
+	if !ok {
+		return xerrors.Errorf("wrong type: %T", message)
+	}
+
+	if _, ok := privateMsg.Recipients[n.GetAddress()]; !ok {
+		return nil
+	}
+
+	embeddedPkt := transport.Packet{
+		Header: nil,
+		Msg:    privateMsg.Msg,
+	}
+
+	err := n.conf.MessageRegistry.ProcessPacket(embeddedPkt)
+	if err != nil {
+		return n.ef("error processing private embedded message", err)
+	}
+
 	return nil
 }
 
@@ -351,6 +387,8 @@ func (n *node) UpdateStatus(source string, newSequence uint) bool {
 	// We update the status if either:
 	//   1. The incoming rumor's sequence number is one larger than the previous
 	//   2. There is no entry for rumors from this source yet and the sequence number is 1
+	n.statusLock.Lock()
+	defer n.statusLock.Unlock()
 	if oldSequence, ok := n.status[source]; (ok && oldSequence == newSequence-1) || (!ok && newSequence == 1) {
 		n.status[source] = newSequence
 		return true
@@ -391,6 +429,9 @@ func (n *node) GetRandomNeighbour(exclude ...string) string {
 
 // CompareViews Returns a case number 1-4 corresponding to the cases in the handout
 func (n *node) CompareViews(theirView map[string]uint) uint {
+	n.statusLock.Lock()
+	defer n.statusLock.Unlock()
+
 	ourView := n.status
 
 	weHaveNewViews, theyHaveNewViews := false, false
@@ -505,7 +546,9 @@ func (n *node) Start() error {
 			default:
 				time.Sleep(n.conf.AntiEntropyInterval)
 
+				n.statusLock.Lock()
 				var statusMsg types.StatusMessage = Copy(n.status)
+				n.statusLock.Unlock()
 				statusMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(statusMsg)
 
 				if err != nil {
@@ -514,11 +557,45 @@ func (n *node) Start() error {
 				}
 
 				dest := n.GetRandomNeighbour()
+
+				if dest == "" {
+					continue
+				}
+
 				err = n.Unicast(dest, statusMsgMarshalled)
 				if err != nil {
 					log.Warn().Msgf("%s: error executing anti-entropy: %s", n.GetAddress(), err)
 					return
 				}
+			}
+		}
+	}()
+
+	// Heartbeat
+	go func() {
+		if n.conf.HeartbeatInterval == 0 {
+			return
+		}
+
+		for {
+			select {
+			case <-n.quit:
+				return
+			default:
+				heartbeatMsg := types.EmptyMessage{}
+				heartbeatMsgMarshalled, err := n.conf.MessageRegistry.MarshalMessage(heartbeatMsg)
+				if err != nil {
+					log.Warn().Msgf("%s: error mashalling heartbeat message: %s", n.GetAddress(), err)
+					return
+				}
+
+				err = n.Broadcast(heartbeatMsgMarshalled)
+				if err != nil {
+					log.Warn().Msgf("%s: error broadcasting heartbeat message: %s", n.GetAddress(), err)
+					return
+				}
+
+				time.Sleep(n.conf.HeartbeatInterval)
 			}
 		}
 	}()
@@ -554,7 +631,7 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 	}
 
 	// This is straight up bs
-	n.ackWaiters[packet.Header.PacketID] = make(chan bool, 1)
+	n.ackWaiters.Add(packet.Header.PacketID, make(chan bool, 1))
 	if msg.Type == (types.RumorsMessage{}).Name() && n.conf.AckTimeout != 0 {
 
 		go func() {
@@ -564,7 +641,7 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 				select {
 
 				// Packet ACK received
-				case <-n.ackWaiters[packet.Header.PacketID]:
+				case <-n.ackWaiters.Get(packet.Header.PacketID):
 					return
 
 				// Timeout reached
@@ -576,6 +653,8 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 					if dest == "" {
 						return
 					}
+
+					packet.Header.Destination = dest
 
 					n.conf.Socket.Send(n.routingTable.m[dest], packet, 0)
 				}
@@ -655,6 +734,7 @@ func (n *node) GetAddress() string {
 	return n.conf.Socket.GetAddress()
 }
 
+// ConcurrentRoutingTable operations
 func (table *ConcurrentRoutingTable) Add(src, dst string) {
 	table.Lock()
 	defer table.Unlock()
@@ -686,6 +766,29 @@ func (table *ConcurrentRoutingTable) CopyTable() peer.RoutingTable {
 	}
 
 	return copiedTable
+}
+
+// ConcurrentAckWaiters opetations
+func (table *ConcurrentAckWaiters) Add(packetId string, channel chan bool) {
+	table.Lock()
+	defer table.Unlock()
+	table.m[packetId] = channel
+}
+
+func (table *ConcurrentAckWaiters) Get(packetId string) chan bool {
+	table.Lock()
+	defer table.Unlock()
+	if val, ok := table.m[packetId]; ok {
+		return val
+	}
+
+	return nil
+}
+
+func (table *ConcurrentAckWaiters) Remove(packetId string) {
+	table.Lock()
+	defer table.Unlock()
+	delete(table.m, packetId)
 }
 
 func (n *node) ef(err1 string, err2 error) error {
