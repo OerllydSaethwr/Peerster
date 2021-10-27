@@ -1,2 +1,1 @@
-# cs438
-homework material for the distributed decentralized system course
+Decentralised peer to peer messaging and file sharing application.
